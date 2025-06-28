@@ -1,0 +1,251 @@
+### criminal_law_ai_agent/
+
+# .env.example
+OPENAI_API_KEY=your_openai_api_key_here
+
+# requirements.txt
+openai
+faiss-cpu
+sentence-transformers
+streamlit
+python-dotenv
+beautifulsoup4
+requests
+
+# Dockerfile
+FROM python:3.10-slim
+WORKDIR /app
+COPY . .
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.enableCORS=false"]
+
+# scrape/austlii_scraper.py
+import requests
+from bs4 import BeautifulSoup
+import os
+
+def get_case_links(base_url, max_cases=10):
+    response = requests.get(base_url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    links = [
+        a['href'] for a in soup.select('a')
+        if '/cgi-bin/viewdoc' in a.get('href', '')
+    ]
+    return links[:max_cases]
+
+def fetch_case_text(url):
+    full_url = f"https://www.austlii.edu.au{url}"
+    response = requests.get(full_url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    return soup.get_text()
+
+def save_case(name, text, output_dir="data/austlii_cases"):
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, f"{name}.txt"), "w") as f:
+        f.write(text)
+
+def main():
+    base_url = "https://www.austlii.edu.au/cgi-bin/sinosrch.cgi?juris=nt&method=boolean&query=sentencing"
+    case_links = get_case_links(base_url)
+    for i, link in enumerate(case_links):
+        case_text = fetch_case_text(link)
+        save_case(f"case_{i}", case_text)
+        print(f"Saved: case_{i}")
+
+if __name__ == "__main__":
+    main()
+
+# scrape/jade_scraper.py
+import requests
+from bs4 import BeautifulSoup
+import os
+
+def get_case_links_jade(search_url, max_cases=10):
+    response = requests.get(search_url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    cases = []
+    for a in soup.select('.search-results a[href^="/judgment/"]'):
+        href = a.get('href')
+        if href:
+            cases.append(f"https://jade.io{href}")
+            if len(cases) >= max_cases:
+                break
+    return cases
+
+def fetch_case_text_jade(url):
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    judgment_div = soup.find('div', class_='judgment-text')
+    return judgment_div.get_text(separator='\n').strip() if judgment_div else ""
+
+def save_case(name, text, output_dir="data/jade_cases"):
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, f"{name}.txt"), "w") as f:
+        f.write(text)
+
+def main():
+    search_url = "https://jade.io/search?query=sentencing"
+    links = get_case_links_jade(search_url)
+    for i, link in enumerate(links):
+        text = fetch_case_text_jade(link)
+        save_case(f"jade_case_{i}", text)
+        print(f"Saved JADE case {i}")
+
+if __name__ == "__main__":
+    main()
+
+# ingest/tagging.py
+import re
+
+def extract_jurisdiction(text):
+    patterns = {
+        "NSW": r"\\bNSWCCA\\b|\\bNSWSC\\b",
+        "NT": r"\\bNTSC\\b|\\bNTCA\\b",
+        "VIC": r"\\bVSC\\b|\\bVCA\\b"
+    }
+    for jurisdiction, pattern in patterns.items():
+        if re.search(pattern, text):
+            return jurisdiction
+    return "Unknown"
+
+def extract_sentencing_factors(text):
+    factors = []
+    if re.search(r"\\bremorse\\b", text, re.I):
+        factors.append("Remorse")
+    if re.search(r"\\bearly plea\\b|\\bguilty plea\\b", text, re.I):
+        factors.append("Early Plea")
+    if re.search(r"\\bprior convictions\\b|\\bprevious convictions\\b", text, re.I):
+        factors.append("Prior Convictions")
+    return factors
+
+# ingest/chunk_and_embed.py
+import os
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from tagging import extract_jurisdiction, extract_sentencing_factors
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def embed_text(text):
+    return model.encode([text])[0]
+
+def chunk_text(text, chunk_size=1000):
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def build_vector_db(folder_path="data/austlii_cases"):
+    index = faiss.IndexFlatL2(384)
+    metadata = []
+    for filename in os.listdir(folder_path):
+        with open(os.path.join(folder_path, filename)) as f:
+            text = f.read()
+        jurisdiction = extract_jurisdiction(text)
+        factors = extract_sentencing_factors(text)
+        chunks = chunk_text(text)
+        for chunk in chunks:
+            vector = embed_text(chunk)
+            index.add(np.array([vector]))
+            metadata.append({
+                "filename": filename,
+                "chunk": chunk,
+                "jurisdiction": jurisdiction,
+                "factors": factors
+            })
+    return index, metadata
+
+# agent/query_agent.py
+import os
+import openai
+import numpy as np
+import faiss
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def filter_metadata(metadata, jurisdiction=None, factors=None):
+    filtered = []
+    for meta in metadata:
+        if jurisdiction and jurisdiction != "All" and meta["jurisdiction"] != jurisdiction:
+            continue
+        if factors:
+            if not all(factor in meta["factors"] for factor in factors):
+                continue
+        filtered.append(meta)
+    return filtered
+
+def retrieve_relevant_chunks(query, _, metadata, jurisdiction=None, factors=None, top_k=5):
+    filtered_meta = filter_metadata(metadata, jurisdiction, factors)
+    if not filtered_meta:
+        return []
+    vectors = np.array([model.encode([m["chunk"]])[0] for m in filtered_meta])
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(vectors)
+    query_vector = model.encode([query])[0]
+    D, I = index.search(np.array([query_vector]), top_k)
+    return [filtered_meta[i] for i in I[0]]
+
+def query_llm(context_chunks, query):
+    context = "\n\n".join([chunk["chunk"] for chunk in context_chunks])
+    prompt = f"""You are a legal research assistant for criminal law in Australia.\nUsing the below context, answer the following question clearly and concisely.\nCite the case names when possible.\n\nContext:\n{context}\n\nQuestion: {query}\nAnswer:"""
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return response["choices"][0]["message"]["content"]
+
+# app.py
+import streamlit as st
+from dotenv import load_dotenv
+from agent.query_agent import retrieve_relevant_chunks, query_llm
+from ingest.chunk_and_embed import build_vector_db
+
+load_dotenv()
+st.set_page_config(page_title="Criminal Law AI Assistant")
+
+st.title("\u2696\ufe0f Australian Criminal Law Research Assistant")
+
+jurisdiction = st.sidebar.selectbox("Select Jurisdiction", ["All", "NSW", "NT", "VIC"])
+factors = st.sidebar.multiselect("Sentencing Factors", ["Remorse", "Early Plea", "Prior Convictions"])
+
+query = st.text_input("Enter a legal query (e.g. 'How is remorse treated in NSW sentencing decisions?')")
+
+if st.button("Search"):
+    with st.spinner("Searching legal database..."):
+        index, metadata = build_vector_db()
+        chunks = retrieve_relevant_chunks(query, index, metadata, jurisdiction, factors)
+        if not chunks:
+            st.warning("No relevant cases found for the selected filters.")
+        else:
+            answer = query_llm(chunks, query)
+            st.success("Results:")
+            st.markdown(answer)
+
+# README.md
+# Criminal Law AI Agent
+
+A GPT-powered assistant for targeted Australian criminal law case research, using RAG over AustLII + JADE decisions.
+
+## Features
+- Web app via Streamlit
+- AustLII/JADE scraping
+- Vector search w/ jurisdiction & sentencing factor filters
+- OpenAI GPT-4 answers with case context
+
+## Setup
+1. `pip install -r requirements.txt`
+2. Create `.env` with your OpenAI API key
+3. Run: `streamlit run app.py`
+4. (Optional) Build & run Docker container:
+   ```bash
+   docker build -t criminal-law-agent .
+   docker run -p 8501:8501 --env-file .env criminal-law-agent
+   ```
+
+---
